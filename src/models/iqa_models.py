@@ -5,7 +5,7 @@ import torchvision.models as models
 from models.captioning_models import PureT
 
 class IQAModel(nn.Module):
-    def __init__(self, vocab_size, embed_dim=256, hidden_dim=512, max_caption_length=30):
+    def __init__(self, vocab_size, embed_dim=256, hidden_dim=512, max_caption_length=50):
         super(IQAModel, self).__init__()
 
         # ResNet50을 사용하여 이미지 특성 추출
@@ -33,7 +33,7 @@ class IQAModel(nn.Module):
         # IQA Model Prediction
         img_features = self.resnet(x)
         img_features_flatten = img_features.view(img_features.size(0), -1)
-        mos = self.regression_head(img_features_flatten) * 10.0
+        mos = self.regression_head(img_features_flatten)
     
         # 차원을 조정합니다. 
         img_features_embedded = self.img_embedding(img_features_flatten)
@@ -47,17 +47,15 @@ class IQAModel(nn.Module):
             return mos, caption_predictions
         
         else:
-            generated_captions = self.greedy_decoding(img_features)
+            generated_captions = self.greedy_decoding(img_features_embedded)
             return mos, generated_captions
-
-        return mos, None
 
     def greedy_decoding(self, img_features):
         input_sequence = torch.ones((img_features.size(0), 1), dtype=torch.long).cuda()  # Assuming model is on CUDA
         for _ in range(self.max_caption_length):
             embedded_captions = self.embedding(input_sequence)
-            transformer_outputs = self.transformer(img_features.permute(1, 0, 2), embedded_captions.permute(1, 0, 2))
-            next_word_predictions = self.fc_out(transformer_outputs[:, -1, :])
+            transformer_outputs = self.transformer(img_features.unsqueeze(1).permute(1, 0, 2), embedded_captions.permute(1, 0, 2))
+            next_word_predictions = self.fc_out(transformer_outputs.permute(1, 0, 2)[:, -1, :])
             _, next_word = next_word_predictions.max(1, keepdim=True)
             input_sequence = torch.cat([input_sequence, next_word], dim=1)
         return input_sequence

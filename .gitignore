@@ -5,3 +5,4 @@ open.zip
 /src/train
 /src/test
 *.pth
+*.pyc

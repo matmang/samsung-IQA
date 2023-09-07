@@ -9,7 +9,7 @@ from collections import OrderedDict
 import warnings
 import argparse
 
-from models.models import TransformerModel
+from models.iqa_models import IQAModel
 
 warnings.filterwarnings(action='ignore')
 
@@ -68,8 +68,8 @@ test_data = pd.read_csv('../data/test.csv')
 test_dataset = CustomDataset(test_data, transform)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-model_path = 'saved_model.pth'
-model = TransformerModel(len(vocab)).cuda() 
+model_path = 'combined_model_checkpoint.pth'
+model = IQAModel(len(vocab)).cuda() 
 
 state_dict = torch.load(model_path)
 new_state_dict = OrderedDict()
