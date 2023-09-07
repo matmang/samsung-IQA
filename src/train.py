@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from tqdm import tqdm
 
 from PIL import Image
 from tqdm import tqdm
@@ -13,7 +12,11 @@ import numpy as np
 import random
 import warnings
 
-from src.models.models import ImageCaptioningModel
+from models.iqa_models import IQAModel
+import argparse
+import torch.distributed as dist
+import torch.nn.parallel
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 warnings.filterwarnings(action='ignore')
 
@@ -68,51 +71,68 @@ class CustomDataset(Dataset):
 train_dataset = CustomDataset(train_data, transform)
 train_loader = DataLoader(train_dataset, batch_size=CFG['BATCH_SIZE'], shuffle=True)
 
-# 모델, 손실함수, 옵티마이저
-emb_dim = 512
-num_heads = 8
-num_layers = 6
-num_classes = 1000  # 필요하지 않지만 VisionTransformer에 필요한 파라미터입니다.
-model = ImageCaptioningModel(CFG['IMG_SIZE'], 16, 3, emb_dim, num_heads, num_layers, num_classes, len(vocab)).cuda()
+# DDP를 위한 설정
+parser = argparse.ArgumentParser(description='DDP example')
+parser.add_argument('--local_rank', default=0, type=int)
+args = parser.parse_args()
 
-if torch.cuda.device_count() > 1:
-    print("Let's use", torch.cuda.device_count(), "GPUs!")
-    model = nn.DataParallel(model)
+torch.cuda.set_device(args.local_rank)
+torch.distributed.init_process_group(backend='nccl', init_method='env://')
+torch.backends.cudnn.benchmark = True
+
+# 모델 및 옵티마이저 설정
+model = IQAModel(len(vocab))
+model = model.cuda(args.local_rank)
+model = DDP(model, device_ids=[args.local_rank], find_unused_parameters=False)
 
 criterion1 = nn.MSELoss()
 criterion2 = nn.CrossEntropyLoss(ignore_index=word2idx['<PAD>'])
-optimizer = torch.optim.Adam(model.parameters(), lr=CFG['LR'], weight_decay=CFG['WEIGHT_DECAY'])
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+optimizer = optim.Adam(model.parameters(), lr=CFG['LR'], weight_decay=CFG['WEIGHT_DECAY'])
 
-# 학습
-model.train()
-for epoch in range(CFG['EPOCHS']):
-    total_loss = 0
-    loop = tqdm(train_loader, leave=True)
-    for imgs, mos, comments in loop:
-        imgs, mos = imgs.float().cuda(), mos.float().cuda()
+# 학습 함수
+def train(train_loader, model, mos_criterion, caption_criterion, optimizer, epoch):
+    model.train()
+    total_loss = 0.0
 
-        # Batch Preprocessing
-        comments_tensor = torch.zeros((len(comments), len(max(comments, key=len)))).long().cuda()
-        for i, comment in enumerate(comments):
-            tokenized = ['<SOS>'] + comment.split() + ['<EOS>']
-            comments_tensor[i, :len(tokenized)] = torch.tensor([word2idx[word] for word in tokenized])
-
-        # Forward & Loss
-        predicted_mos, predicted_comments = model(imgs, comments_tensor)
-        loss1 = criterion1(predicted_mos.squeeze(1), mos)
-        loss2 = criterion2(predicted_comments.view(-1, len(vocab)), comments_tensor.view(-1))
-        loss = loss1 + loss2
-
-        # Backpropagation
+    # tqdm 객체 생성. position=0으로 설정하면 출력이 겹치지 않음. local_rank==0인 경우에만 출력
+    progress_bar = tqdm(enumerate(train_loader), total=len(train_loader), position=0, leave=True) if args.local_rank == 0 else enumerate(train_loader)
+    for i, (images, mos, comments) in progress_bar:
+        images, mos = images.float().cuda(args.local_rank, non_blocking=True), mos.float().cuda(args.local_rank, non_blocking=True)
         optimizer.zero_grad()
+
+        # Convert comments to tensor
+        comments_idx = [torch.Tensor([word2idx[word] for word in comment.split()]) for comment in comments]
+        comments_tensor = nn.utils.rnn.pad_sequence(comments_idx, batch_first=True).long()
+        comments_tensor = comments_tensor.cuda(args.local_rank, non_blocking=True)
+
+        mos_pred, captions_pred = model(images, comments_tensor)
+
+        # Loss calculation: sum of mos loss and captioning loss
+        mos_loss = mos_criterion(mos_pred.squeeze(), mos)
+        caption_loss = caption_criterion(captions_pred.view(-1, len(vocab)), comments_tensor.view(-1))
+        loss = mos_loss + caption_loss
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), CFG['GRADIENT_CLIP'])
         optimizer.step()
 
         total_loss += loss.item()
-        loop.set_description(f"Epoch {epoch + 1}")
-        loop.set_postfix(loss=loss.item())
 
-    print(f"Epoch {epoch + 1} finished with average loss: {total_loss / len(train_loader):.4f}")
+        # tqdm 설명 업데이트 (args.local_rank == 0일 때만)
+        if args.local_rank == 0:
+            avg_loss = total_loss / (i+1)
+            progress_bar.set_description(f"Epoch {epoch+1}, Avg Loss: {avg_loss:.4f}")
 
+
+    
+    print(f"Epoch {epoch+1}, Loss: {total_loss/len(train_loader)}")
+
+# 학습 실행
+for epoch in range(CFG['EPOCHS']):
+    train(train_loader, model, criterion1, criterion2, optimizer, epoch)
+
+# 체크포인트 저장
+if args.local_rank == 0:
+    torch.save(model.module.state_dict(), "combined_model_checkpoint.pth")
+
+print("Training finished!")

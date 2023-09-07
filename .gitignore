@@ -2,3 +2,6 @@
 /notebooks/test
 /notebooks/train
 open.zip
+/src/train
+/src/test
+*.pth
